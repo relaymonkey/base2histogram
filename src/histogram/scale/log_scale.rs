@@ -1,4 +1,4 @@
-use std::sync::LazyLock;
+use std::sync::OnceLock;
 
 use super::bucket_span::BucketSpan;
 use super::log_scale_config::LogScaleConfig;
@@ -19,8 +19,11 @@ pub struct LogScale {
     small_value_buckets: Vec<u8>,
 }
 
-static LOG_SCALES: LazyLock<Vec<LogScale>> =
-    LazyLock::new(|| (LogScaleConfig::MIN_WIDTH..=LogScaleConfig::MAX_WIDTH).map(LogScale::new).collect());
+/// One shared instance per width, each built on its first request. The tables for all sixteen
+/// widths together take about 26 MiB (width 16 alone 13 MiB), and a process typically uses one
+/// width.
+static LOG_SCALES: [OnceLock<LogScale>; LogScaleConfig::MAX_WIDTH] =
+    [const { OnceLock::new() }; LogScaleConfig::MAX_WIDTH];
 
 impl LogScale {
     pub const DEFAULT_WIDTH: usize = 3;
@@ -28,7 +31,14 @@ impl LogScale {
     /// Returns a shared `LogScale` instance for the given width (1..=16).
     pub fn get(width: usize) -> &'static LogScale {
         LogScaleConfig::validate_width(width);
-        &LOG_SCALES[width - 1]
+        LOG_SCALES[width - 1].get_or_init(|| LogScale::new(width))
+    }
+
+    /// Whether the shared instance for `width` has been built.
+    #[cfg(test)]
+    pub(crate) fn is_built(width: usize) -> bool {
+        LogScaleConfig::validate_width(width);
+        LOG_SCALES[width - 1].get().is_some()
     }
 
     /// Creates a new `LogScale` for the given width configuration.
@@ -141,6 +151,39 @@ mod tests {
             scale.num_buckets(),
             LogScale::get(LogScale::DEFAULT_WIDTH).num_buckets()
         );
+    }
+
+    /// `get` builds the table for the requested width only, once, and hands out the same instance
+    /// after. Widths 12 and 13 are reserved for this test: no other test in this binary may
+    /// request them, or their state would depend on test order.
+    #[test]
+    fn test_get_builds_only_the_requested_width() {
+        assert!(!LogScale::is_built(12));
+        assert!(!LogScale::is_built(13));
+
+        let scale = LogScale::get(12);
+
+        assert!(LogScale::is_built(12));
+        assert!(!LogScale::is_built(13));
+        assert_eq!(scale.num_buckets(), LogScaleConfig::new(12).buckets());
+        assert!(std::ptr::eq(scale, LogScale::get(12)));
+    }
+
+    /// A lazily built shared instance is the same table as a freshly constructed one.
+    #[test]
+    fn test_get_matches_a_fresh_scale() {
+        for width in (1..=10).chain([16]) {
+            let shared = LogScale::get(width);
+            let fresh = LogScale::new(width);
+            assert_eq!(shared, &fresh, "width {width}");
+            for value in [0, 1, 7, 4095, 4096, 1 << 20, u64::MAX] {
+                assert_eq!(
+                    shared.calculate_bucket(value),
+                    fresh.calculate_bucket(value),
+                    "width {width} value {value}"
+                );
+            }
+        }
     }
 
     #[test]
